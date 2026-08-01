@@ -1,0 +1,833 @@
+<!DOCTYPE html>\n<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<title>Deepti Bhatta — Healthcare Data Scientist</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&amp;family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;1,8..60,400&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F2F3EF;
+    --ink:#16262A;
+    --teal:#1F6F64;
+    --teal-dark:#154D45;
+    --amber:#C98A2E;
+    --line:#D8DDD4;
+    --muted:#5B6B66;
+    --card:#FFFFFF;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Source Serif 4', serif;
+    line-height:1.6;
+  }
+  h1,h2,h3,.disp{font-family:'Space Grotesk', sans-serif;}
+  .mono{font-family:'IBM Plex Mono', monospace;}
+  a{color:var(--teal-dark);}
+
+  .wrap{max-width:960px;margin:0 auto;padding:0 32px;}
+  section{padding:88px 0;border-bottom:1px solid var(--line);}
+  section:last-of-type{border-bottom:none;}
+
+  /* ---------- Top bar / edit controls ---------- */
+  .toolbar{
+    position:sticky;top:0;z-index:50;
+    background:rgba(242,243,239,0.92);
+    backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);
+  }
+  .toolbar-inner{max-width:960px;margin:0 auto;padding:14px 32px;display:flex;justify-content:space-between;align-items:center;gap:12px;}
+  .toolbar .brand{font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.08em;color:var(--muted);}
+  .btn{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;letter-spacing:.04em;
+    border:1px solid var(--ink);
+    background:transparent;color:var(--ink);
+    padding:9px 16px;border-radius:2px;
+    cursor:pointer;transition:background .15s ease, color .15s ease;
+  }
+  .btn:hover{background:var(--ink);color:var(--paper);}
+  .btn.primary{background:var(--teal);border-color:var(--teal);color:#fff;}
+  .btn.primary:hover{background:var(--teal-dark);border-color:var(--teal-dark);}
+  .btn-row{display:flex;gap:8px;}
+  .edit-hint{
+    display:none;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px;color:var(--teal-dark);background:#E4EFEC;
+    padding:8px 32px;text-align:center;letter-spacing:.03em;
+  }
+  body.editing .edit-hint{display:block;}
+  body.editing [contenteditable="true"]{
+    outline:1px dashed #B9C6C2;outline-offset:4px;border-radius:2px;
+  }
+  body.editing [contenteditable="true"]:hover{outline-color:var(--teal);}
+  body.editing [contenteditable="true"]:focus{outline:1px solid var(--teal);background:#FBFDFC;}
+
+  /* image upload affordance */
+  .img-slot{position:relative;overflow:hidden;background:#E7EAE5;}
+  .img-slot img{width:100%;height:100%;object-fit:cover;display:block;}
+  .img-upload-btn{
+    display:none;
+    position:absolute;inset:auto 8px 8px auto;
+    font-family:'IBM Plex Mono',monospace;font-size:10px;
+    background:var(--ink);color:#fff;border:none;
+    padding:6px 10px;border-radius:2px;cursor:pointer;letter-spacing:.03em;
+  }
+  body.editing .img-upload-btn{display:inline-block;}
+  .img-slot input[type=file]{display:none;}
+  .img-placeholder{
+    display:flex;align-items:center;justify-content:center;
+    height:100%;width:100%;
+    font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted);
+    text-align:center;padding:12px;
+  }
+
+  /* ---------- Hero ---------- */
+  .hero{padding-top:64px;}
+  .eyebrow{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.14em;
+    color:var(--teal-dark);text-transform:uppercase;margin-bottom:18px;
+  }
+  .hero h1{
+    font-size:clamp(42px,7vw,74px);font-weight:600;margin:0 0 14px;line-height:1.02;letter-spacing:-.01em;
+  }
+  .hero .tagline{
+    font-family:'Source Serif 4',serif;font-style:italic;font-size:21px;color:var(--muted);
+    max-width:560px;margin:0 0 40px;
+  }
+  .pulse-wrap{margin:24px 0 44px;}
+  .pulse-wrap svg{width:100%;height:auto;display:block;}
+  .pulse-path{
+    fill:none;stroke:var(--teal);stroke-width:2.5;
+    stroke-dasharray:1400;stroke-dashoffset:1400;
+    animation:draw 2.6s ease-out forwards .2s;
+  }
+  .pulse-bars rect{
+    fill:var(--amber);opacity:0;
+    animation:rise .5s ease-out forwards;
+  }
+  @keyframes draw{to{stroke-dashoffset:0;}}
+  @keyframes rise{from{opacity:0;transform:scaleY(0);}to{opacity:1;transform:scaleY(1);}}
+  @media (prefers-reduced-motion: reduce){
+    .pulse-path{animation:none;stroke-dashoffset:0;}
+    .pulse-bars rect{animation:none;opacity:1;}
+  }
+  .contact-row{display:flex;flex-wrap:wrap;gap:20px;font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--muted);}
+  .contact-row a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--line);}
+  .contact-row a:hover{border-color:var(--ink);}
+
+  /* ---------- Section headings ---------- */
+  .sec-label{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--teal-dark);margin:0 0 8px;
+  }
+  .sec-title{font-size:30px;font-weight:600;margin:0 0 36px;}
+
+  /* ---------- About ---------- */
+  .about-grid{display:grid;grid-template-columns:200px 1fr;gap:44px;align-items:start;}
+  .about-photo{width:200px;height:200px;border-radius:4px;}
+  .about-photo .img-placeholder{background:#E7EAE5;}
+  .about-body p{font-size:18px;color:#26383A;margin:0 0 16px;}
+
+  /* ---------- Skills ---------- */
+  .skill-group{margin-bottom:22px;}
+  .skill-group .label{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--muted);letter-spacing:.06em;margin-bottom:10px;}
+  .tags{display:flex;flex-wrap:wrap;gap:8px;}
+  .tag{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;
+    border:1px solid var(--line);background:var(--card);
+    padding:6px 12px;border-radius:20px;color:var(--ink);
+  }
+
+  /* ---------- Projects ---------- */
+  .project-card{
+    display:grid;grid-template-columns:280px 1fr;gap:32px;
+    background:var(--card);border:1px solid var(--line);border-radius:4px;
+    overflow:hidden;margin-bottom:28px;
+  }
+  .project-card .img-slot{height:100%;min-height:210px;}
+  .project-body{padding:26px 26px 26px 0;}
+  .project-title{font-size:21px;font-weight:600;margin:0 0 6px;}
+  .project-stack{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--amber);letter-spacing:.03em;margin-bottom:14px;}
+  .project-body ul{margin:0;padding-left:18px;}
+  .project-body li{margin-bottom:8px;font-size:15.5px;color:#26383A;}
+  @media (max-width:640px){
+    .project-card{grid-template-columns:1fr;}
+    .project-card .img-slot{height:180px;}
+    .project-body{padding:20px;}
+  }
+
+  /* ---------- Experience timeline ---------- */
+  .tl-item{display:grid;grid-template-columns:150px 1fr;gap:24px;padding-bottom:34px;position:relative;}
+  .tl-item:not(:last-child){border-bottom:1px dotted var(--line);margin-bottom:0;}
+  .tl-date{font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--muted);padding-top:3px;}
+  .tl-role{font-size:18px;font-weight:600;margin:0 0 2px;}
+  .tl-org{font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--teal-dark);margin-bottom:12px;}
+  .tl-item ul{margin:0;padding-left:18px;}
+  .tl-item li{margin-bottom:7px;font-size:15.5px;color:#26383A;}
+  @media (max-width:640px){.tl-item{grid-template-columns:1fr;}}
+
+  /* ---------- Education / certs ---------- */
+  .ed-item{margin-bottom:18px;}
+  .ed-title{font-weight:600;font-size:17px;margin-bottom:2px;}
+  .ed-meta{font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--muted);}
+
+  /* ---------- Footer ---------- */
+  footer{padding:60px 0 80px;}
+  footer .sec-title{margin-bottom:14px;}
+  footer p{color:var(--muted);max-width:480px;}
+
+  ::selection{background:#CFE6E0;}
+</style>
+</head>
+<body id="artifacts-component-root-html" class="">
+
+
+
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="eyebrow">Healthcare Data Scientist &amp; Clinical Informatics</div>
+    <h1 contenteditable="false">Deepti Bhatta</h1>
+    <p class="tagline" contenteditable="false">Seven years turning bedside clinical judgment into data that hospitals can act on — now building toward healthcare AI.</p>
+
+    <div class="pulse-wrap">
+      <svg viewBox="0 0 900 140" preserveAspectRatio="none">
+        <path class="pulse-path" d="M0,70 L140,70 L165,70 L180,20 L205,120 L225,40 L245,70 L400,70 L420,70 L440,55 L460,70 L620,70"></path>
+        <g class="pulse-bars">
+          <rect x="650" y="90" width="16" height="30" style="animation-delay:2.4s"></rect>
+          <rect x="676" y="70" width="16" height="50" style="animation-delay:2.5s" transform-origin="684 120"></rect>
+          <rect x="702" y="50" width="16" height="70" style="animation-delay:2.6s" transform-origin="710 120"></rect>
+          <rect x="728" y="30" width="16" height="90" style="animation-delay:2.7s" transform-origin="736 120"></rect>
+          <rect x="754" y="60" width="16" height="60" style="animation-delay:2.8s" transform-origin="762 120"></rect>
+          <rect x="780" y="15" width="16" height="105" style="animation-delay:2.9s" transform-origin="788 120"></rect>
+          <rect x="806" y="45" width="16" height="75" style="animation-delay:3.0s" transform-origin="814 120"></rect>
+          <rect x="832" y="25" width="16" height="95" style="animation-delay:3.1s" transform-origin="840 120"></rect>
+        </g>
+      </svg>
+    </div>
+
+    <div class="contact-row">
+      <span>Austin, TX</span>
+      <a href="mailto:bhattadeepti47@gmail.com">bhattadeepti47@gmail.com</a>
+      <span>616-820-9828</span>
+      <a href="https://www.linkedin.com/in/deepti-bhatta-762507200/" target="_blank">LinkedIn</a>
+    </div>
+  </section>
+
+  <!-- ABOUT -->
+  <section id="about">
+    <div class="sec-label">About</div>
+    <h2 class="sec-title">Profile</h2>
+    <div class="about-grid">
+      <div class="about-photo img-slot" data-target="aboutPhoto">
+        <div class="img-placeholder" id="aboutPhotoPlaceholder" style="display: none;">Add<br>photo</div>
+        <img id="aboutPhoto" style="display: block;" src="data:image/jpeg;base64,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">
+        <button class="img-upload-btn" data-input="aboutPhotoInput">Add photo</button>
+        <input type="file" accept="image/*" id="aboutPhotoInput">
+      </div>
+      <div class="about-body" contenteditable="false">
+        <p>Healthcare Data Scientist and Analytics professional with 7+ years bridging bedside clinical practice and enterprise data science. Registered Nurse (Texas) with a Master of Science in Analytics from Georgia Institute of Technology, combining clinical domain expertise with SQL, Python, R, and machine learning.</p>
+        <p>I build predictive models, automated pipelines, and executive dashboards that measurably improve patient outcomes and operational efficiency — and I translate ambiguous clinical and financial questions into production-ready analytics for interdisciplinary stakeholders. I'm now looking to bring that foundation to healthcare AI, clinical decision-support, and applied data science roles.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- SKILLS -->
+  <section id="skills">
+    <div class="sec-label">Toolkit</div>
+    <h2 class="sec-title">Core Competencies</h2>
+
+    <div class="skill-group">
+      <div class="label">PROGRAMMING &amp; MODELING</div>
+      <div class="tags" contenteditable="false">
+        <span class="tag">SQL Server</span><span class="tag">SQL</span><span class="tag">Python</span>
+        <span class="tag">Pandas</span><span class="tag">NumPy</span><span class="tag">Scikit-learn</span>
+        <span class="tag">R</span><span class="tag">SAS</span><span class="tag">Machine Learning</span>
+        <span class="tag">Statistical Modeling</span><span class="tag">Classification</span>
+        <span class="tag">Regression</span><span class="tag">Clustering</span><span class="tag">Forecasting</span>
+        <span class="tag">Feature Engineering</span>
+      </div>
+    </div>
+
+    <div class="skill-group">
+      <div class="label">HEALTHCARE ANALYTICS</div>
+      <div class="tags" contenteditable="false">
+        <span class="tag">Clinical Analytics</span><span class="tag">Quality Metrics</span>
+        <span class="tag">Claims Analytics</span><span class="tag">Pharmacy Reporting</span>
+        <span class="tag">Clinical Informatics</span><span class="tag">Meditech</span>
+        <span class="tag">Medisolv</span><span class="tag">Population Health</span>
+        <span class="tag">Clinical Decision Support</span><span class="tag">HIPAA Compliance</span>
+      </div>
+    </div>
+
+    <div class="skill-group">
+      <div class="label">BI &amp; VISUALIZATION</div>
+      <div class="tags" contenteditable="false">
+        <span class="tag">Tableau</span><span class="tag">Power BI</span><span class="tag">Plotly Dash</span>
+        <span class="tag">Excel / VBA</span><span class="tag">Matplotlib</span>
+      </div>
+    </div>
+
+    <div class="skill-group">
+      <div class="label">CLINICAL FOUNDATION</div>
+      <div class="tags" contenteditable="false">
+        <span class="tag">Registered Nurse</span><span class="tag">Clinical Documentation Improvement</span>
+        <span class="tag">Patient Safety</span><span class="tag">Infection Prevention</span>
+        <span class="tag">Hospital Operations</span><span class="tag">Quality Improvement</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROJECTS -->
+  <section id="projects">
+    <div class="sec-label">Selected Work</div>
+    <h2 class="sec-title">Featured Projects</h2>
+
+    <div class="project-card">
+      <div class="img-slot" data-target="proj1Img">
+        <div class="img-placeholder" id="proj1Placeholder">Add<br>project image</div>
+        <img id="proj1Img" style="display:none;">
+        <button class="img-upload-btn" data-input="proj1Input">Add photo</button>
+        <input type="file" accept="image/*" id="proj1Input">
+      </div>
+      <div class="project-body" contenteditable="false">
+        <div class="project-title">Flight Delay Prediction &amp; Analytics Dashboard</div>
+        <div class="project-stack">PYTHON · SQL · MACHINE LEARNING · PLOTLY DASH · FLASK · D3.JS</div>
+        <ul>
+          <li>Processed and analyzed 61M+ records with SQL and Python across a full end-to-end ETL, feature engineering, and modeling pipeline.</li>
+          <li>Built a Logistic Regression model (Scikit-learn, GridSearchCV) to predict flight delays — Recall: 66%, AUC: 0.67.</li>
+          <li>Delivered results through an interactive Plotly Dash / Flask / D3.js dashboard for exploratory analysis.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="project-card">
+      <div class="img-slot" data-target="proj2Img">
+        <div class="img-placeholder" id="proj2Placeholder">Add<br>project image</div>
+        <img id="proj2Img" style="display:none;">
+        <button class="img-upload-btn" data-input="proj2Input">Add photo</button>
+        <input type="file" accept="image/*" id="proj2Input">
+      </div>
+      <div class="project-body" contenteditable="false">
+        <div class="project-title">U.S. Stock Price Prediction Using Candlestick Charts</div>
+        <div class="project-stack">PYTHON · RANDOM FOREST · TA-LIB · FEATURE ENGINEERING</div>
+        <ul>
+          <li>Built a Random Forest classifier to predict bullish/bearish price movement across 50+ industry sectors.</li>
+          <li>Engineered predictive features (SMA, EMA, RSI, MACD, rolling mean/std, daily returns) and tuned hyperparameters.</li>
+          <li>Achieved 85–90% precision, recall, and F1-score, validated via ROC curve and confusion matrix.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- EXPERIENCE -->
+  <section id="experience">
+    <div class="sec-label">Career</div>
+    <h2 class="sec-title">Professional Experience</h2>
+
+    <div class="tl-item" contenteditable="false">
+      <div class="tl-date">MAR 2021 – JUL 2026</div>
+      <div>
+        <div class="tl-role">Clinical Informatics Analyst II</div>
+        <div class="tl-org">WILSON MEDICAL CENTER, NORTH CAROLINA</div>
+        <ul>
+          <li>Designed interactive Tableau and Power BI dashboards for Sepsis and Heart Failure quality metrics that contributed to reduced mortality and hospital readmission.</li>
+          <li>Automated reporting pipelines using SQL, Python, Medisolv, and Excel VBA, saving ~16 hours per week across multiple departments.</li>
+          <li>Served as Clinical Subject Matter Expert (SME) for SQL reporting and Meditech data structures, mentoring analysts.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="tl-item" contenteditable="false">
+      <div class="tl-date">OCT 2018 – MAR 2021</div>
+      <div>
+        <div class="tl-role">Registered Nurse (Medical-Surgical)</div>
+        <div class="tl-org">SAMPSON REGIONAL MEDICAL CENTER</div>
+        <ul>
+          <li>Delivered direct patient care using EHR systems for clinical documentation, medication administration, and outcome tracking.</li>
+          <li>Maintained documentation accuracy and compliance with quality, regulatory, and patient-safety standards.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="tl-item" contenteditable="false">
+      <div class="tl-date">NOV 2016 – MAY 2017</div>
+      <div>
+        <div class="tl-role">Public Health Data Analyst</div>
+        <div class="tl-org">INSTITUTE OF MEDICINE, KATHMANDU, NEPAL</div>
+        <ul>
+          <li>Analyzed epidemiological and public health datasets using R and SPSS to identify disease trends.</li>
+          <li>Built automated data preparation and visualization workflows, reducing manual processing by 20–40 hours per project.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="tl-item" contenteditable="false">
+      <div class="tl-date">JUL 2015 – NOV 2016</div>
+      <div>
+        <div class="tl-role">Registered Nurse — Surgical Ward</div>
+        <div class="tl-org">INSTITUTE OF MEDICINE, NEPAL</div>
+        <ul>
+          <li>Managed care for surgical patients while documenting clinical information within hospital information systems.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- EDUCATION -->
+  <section id="education">
+    <div class="sec-label">Background</div>
+    <h2 class="sec-title">Education &amp; Licensure</h2>
+
+    <div class="ed-item" contenteditable="false">
+      <div class="ed-title">Master of Science in Analytics — Georgia Institute of Technology</div>
+      <div class="ed-meta">GPA 3.75 · Computational Data Analysis, Machine Learning, Regression Analysis, Statistical Modeling, Visual Analytics, Data Simulation</div>
+    </div>
+    <div class="ed-item" contenteditable="false">
+      <div class="ed-title">Bachelor of Science in Nursing — B.P. Koirala Institute of Health Sciences</div>
+      <div class="ed-meta">Merit scholarship (1 of 3,000 applicants) · Graduated with Distinction, 2nd rank</div>
+    </div>
+    <div class="ed-item" contenteditable="false">
+      <div class="ed-title">Registered Nurse (RN) — Texas Board of Nursing</div>
+      <div class="ed-meta">Certifications: CGFNS Certified, ACLS, PALS, BLS · Languages: English, Nepali, Hindi</div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="sec-label">Get in touch</div>
+    <h2 class="sec-title">Let's talk</h2>
+    <p contenteditable="false">Open to healthcare AI, clinical decision-support, and applied data science roles. Reach out by email or LinkedIn.</p>
+    <div class="contact-row" style="margin-top:18px;">
+      <a href="mailto:bhattadeepti47@gmail.com">bhattadeepti47@gmail.com</a>
+      <a href="https://www.linkedin.com/in/deepti-bhatta-762507200/" target="_blank">LinkedIn</a>
+    </div>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  const body = document.body;
+  const editToggle = document.getElementById('editToggle');
+  const saveBtn = document.getElementById('saveBtn');
+  const editableTargets = document.querySelectorAll(
+    'h1, .tagline, .about-body, .tags, .project-body, .tl-item, .ed-item, footer p'
+  );
+
+  function setEditing(on){
+    body.classList.toggle('editing', on);
+    editableTargets.forEach(el => el.setAttribute('contenteditable', on ? 'true' : 'false'));
+    editToggle.textContent = on ? 'Done editing' : 'Edit portfolio';
+  }
+  editToggle.addEventListener('click', () => setEditing(!body.classList.contains('editing')));
+
+  // image upload wiring
+  document.querySelectorAll('.img-upload-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.getElementById(btn.dataset.input).click();
+    });
+  });
+  document.querySelectorAll('.img-slot input[type=file]').forEach(input => {
+    input.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if(!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const slot = input.closest('.img-slot');
+        const img = slot.querySelector('img');
+        const placeholder = slot.querySelector('.img-placeholder');
+        img.src = ev.target.result;
+        img.style.display = 'block';
+        if(placeholder) placeholder.style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+    });
+  });
+
+  // download current state as a standalone html file
+  saveBtn.addEventListener('click', () => {
+    setEditing(false);
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelectorAll('.toolbar, .edit-hint').forEach(el => el.remove());
+    clone.classList.remove('editing');
+    const html = '<!DOCTYPE html>\\n' + clone.outerHTML;
+    const blob = new Blob([html], {type:'text/html'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'deepti-bhatta-portfolio.html';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+
+
+
+</body></html>
